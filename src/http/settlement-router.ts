@@ -12,6 +12,10 @@ import {
   principalOf,
   type AccessPolicy,
 } from "../security/parc-service-auth.js";
+import {
+  breakTreatments,
+  type PostingService,
+} from "../services/posting-service.js";
 import type { SettlementReadService } from "../services/read-service.js";
 import {
   breakTypes,
@@ -99,15 +103,37 @@ const resolveInput = z
   })
   .strict();
 
+// CB-7 slice B (D185–D189).
+const postingNote = z.string().trim().min(10).max(1000);
+const previewPostingInput = z
+  .object({ treatment: z.enum(breakTreatments), note: postingNote })
+  .strict();
+const postPostingInput = z
+  .object({
+    treatment: z.enum(breakTreatments),
+    note: postingNote,
+    approval_id: uuid,
+  })
+  .strict();
+const previewReleaseInput = z.object({ note: postingNote }).strict();
+const releaseInput = z
+  .object({ note: postingNote, approval_id: uuid })
+  .strict();
+const clearInput = z.object({ journal_id: uuid, note: postingNote }).strict();
+const noteInput = z
+  .object({ note: z.string().trim().min(1).max(2000) })
+  .strict();
+
 export interface SettlementRouterInput {
   statements: StatementService;
   reconciliation: ReconciliationService;
+  postings: PostingService;
   reads: SettlementReadService;
   require: (policy: AccessPolicy) => RequestHandler;
 }
 
 export function createSettlementRouter(input: SettlementRouterInput): Router {
-  const { statements, reconciliation, reads, require } = input;
+  const { statements, reconciliation, postings, reads, require } = input;
   const router = Router();
   const read = require(settlementPolicies.read);
   const manage = require(settlementPolicies.manage);
@@ -321,6 +347,132 @@ export function createSettlementRouter(input: SettlementRouterInput): Router {
         tenant(request),
         id(request),
         { resolutionType: body.resolution_type, note: body.note },
+        actor(request),
+        idempotencyKey(request),
+      );
+      response.status(result.replayed ? 200 : 201).json(result);
+    }),
+  );
+
+  router.post(
+    "/internal/v1/reconciliation-breaks/:id/posting-resolutions/preview",
+    manage,
+    route(async (request, response) => {
+      const body = previewPostingInput.parse(request.body);
+      response.json(
+        await postings.previewBreak(
+          tenant(request),
+          id(request),
+          body,
+          actor(request),
+          idempotencyKey(request),
+        ),
+      );
+    }),
+  );
+  router.post(
+    "/internal/v1/reconciliation-breaks/:id/posting-resolutions",
+    manage,
+    route(async (request, response) => {
+      const body = postPostingInput.parse(request.body);
+      const result = await postings.postBreak(
+        tenant(request),
+        id(request),
+        {
+          treatment: body.treatment,
+          note: body.note,
+          approvalId: body.approval_id,
+        },
+        actor(request),
+        idempotencyKey(request),
+      );
+      response.status(result.replayed ? 200 : 201).json(result);
+    }),
+  );
+
+  router.get(
+    "/internal/v1/suspense-investigations",
+    read,
+    route(async (request, response) => {
+      const query = z
+        .object({
+          ...paging,
+          status: z.enum(["OPEN", "CLOSED"]).optional(),
+          participant_id: uuid.optional(),
+        })
+        .parse(request.query);
+      response.json(
+        await reads.listInvestigations(tenant(request), {
+          pageSize: query.page_size,
+          cursor: query.page_cursor,
+          status: query.status,
+          participantId: query.participant_id,
+        }),
+      );
+    }),
+  );
+  router.get(
+    "/internal/v1/suspense-investigations/:id",
+    read,
+    route(async (request, response) => {
+      response.json(await reads.getInvestigation(tenant(request), id(request)));
+    }),
+  );
+  router.post(
+    "/internal/v1/suspense-investigations/:id/notes",
+    manage,
+    route(async (request, response) => {
+      const body = noteInput.parse(request.body);
+      const result = await postings.addNote(
+        tenant(request),
+        id(request),
+        body.note,
+        actor(request),
+        idempotencyKey(request),
+      );
+      response.status(result.replayed ? 200 : 201).json(result);
+    }),
+  );
+  router.post(
+    "/internal/v1/suspense-investigations/:id/release/preview",
+    manage,
+    route(async (request, response) => {
+      const body = previewReleaseInput.parse(request.body);
+      response.json(
+        await postings.previewRelease(
+          tenant(request),
+          id(request),
+          body,
+          actor(request),
+          idempotencyKey(request),
+        ),
+      );
+    }),
+  );
+  router.post(
+    "/internal/v1/suspense-investigations/:id/release",
+    manage,
+    route(async (request, response) => {
+      const body = releaseInput.parse(request.body);
+      const result = await postings.release(
+        tenant(request),
+        id(request),
+        { note: body.note, approvalId: body.approval_id },
+        actor(request),
+        idempotencyKey(request),
+      );
+      response.status(result.replayed ? 200 : 201).json(result);
+    }),
+  );
+  router.post(
+    "/internal/v1/suspense-investigations/:id/clear-by-journal",
+    manage,
+    route(async (request, response) => {
+      const body = clearInput.parse(request.body);
+      const result = await postings.clearByJournal(
+        tenant(request),
+        id(request),
+        { journalId: body.journal_id, note: body.note },
         actor(request),
         idempotencyKey(request),
       );

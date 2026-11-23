@@ -36,6 +36,12 @@ CREATE FUNCTION settlement.guard_break() RETURNS trigger
       IF OLD.status <> 'OPEN' THEN
         RAISE EXCEPTION 'A resolved break stays resolved' USING ERRCODE = '55000';
       END IF;
+      IF EXISTS (
+        SELECT 1 FROM settlement.posting_requests p
+         WHERE p.tenant_id = OLD.tenant_id AND p.break_id = OLD.id AND p.status = 'PENDING'
+      ) THEN
+        RAISE EXCEPTION 'A posting is pending for this break' USING ERRCODE = '55000';
+      END IF;
       RETURN NEW;
     END $$;
 
@@ -79,6 +85,21 @@ CREATE FUNCTION settlement.guard_expected_item() RETURNS trigger
 
 
 --
+-- Name: guard_posting_request(); Type: FUNCTION; Schema: settlement; Owner: -
+--
+
+CREATE FUNCTION settlement.guard_posting_request() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      IF OLD.status <> 'PENDING' THEN
+        RAISE EXCEPTION 'A finished posting request stays finished' USING ERRCODE = '55000';
+      END IF;
+      RETURN NEW;
+    END $$;
+
+
+--
 -- Name: guard_run(); Type: FUNCTION; Schema: settlement; Owner: -
 --
 
@@ -88,6 +109,21 @@ CREATE FUNCTION settlement.guard_run() RETURNS trigger
     BEGIN
       IF OLD.status <> 'RUNNING' THEN
         RAISE EXCEPTION 'A finished reconciliation run does not change' USING ERRCODE = '55000';
+      END IF;
+      RETURN NEW;
+    END $$;
+
+
+--
+-- Name: guard_suspense_investigation(); Type: FUNCTION; Schema: settlement; Owner: -
+--
+
+CREATE FUNCTION settlement.guard_suspense_investigation() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      IF OLD.status <> 'OPEN' THEN
+        RAISE EXCEPTION 'A closed investigation stays closed' USING ERRCODE = '55000';
       END IF;
       RETURN NEW;
     END $$;
@@ -107,6 +143,24 @@ CREATE FUNCTION settlement.outbox_tenants_with_work() RETURNS SETOF uuid
 
 
 --
+-- Name: purge_expired_admin_exports(); Type: FUNCTION; Schema: settlement; Owner: -
+--
+
+CREATE FUNCTION settlement.purge_expired_admin_exports() RETURNS integer
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog', 'settlement'
+    AS $$
+    DECLARE purged integer;
+    BEGIN
+      UPDATE settlement.admin_exports
+         SET status = 'EXPIRED', content = NULL
+       WHERE status = 'READY' AND expires_at <= now();
+      GET DIAGNOSTICS purged = ROW_COUNT;
+      RETURN purged;
+    END $$;
+
+
+--
 -- Name: reject_mutation(); Type: FUNCTION; Schema: settlement; Owner: -
 --
 
@@ -119,6 +173,59 @@ CREATE FUNCTION settlement.reject_mutation() RETURNS trigger
 SET default_tablespace = '';
 
 SET default_table_access_method = heap;
+
+--
+-- Name: admin_export_downloads; Type: TABLE; Schema: settlement; Owner: -
+--
+
+CREATE TABLE settlement.admin_export_downloads (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    export_id uuid NOT NULL,
+    downloaded_by uuid NOT NULL,
+    correlation_id uuid,
+    downloaded_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+ALTER TABLE ONLY settlement.admin_export_downloads FORCE ROW LEVEL SECURITY;
+
+
+--
+-- Name: admin_exports; Type: TABLE; Schema: settlement; Owner: -
+--
+
+CREATE TABLE settlement.admin_exports (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    kind character varying(100) NOT NULL,
+    parameters jsonb NOT NULL,
+    status character varying(20) NOT NULL,
+    requested_by uuid NOT NULL,
+    reason_code character varying(50) NOT NULL,
+    idempotency_key character varying(200) NOT NULL,
+    request_hash character(64) NOT NULL,
+    row_count integer,
+    byte_size integer,
+    content text,
+    content_sha256 character(64),
+    failure_code character varying(100),
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    completed_at timestamp with time zone,
+    expires_at timestamp with time zone NOT NULL,
+    CONSTRAINT admin_exports_row_count_check CHECK (((row_count IS NULL) OR ((row_count >= 0) AND (row_count <= 50000)))),
+    CONSTRAINT admin_exports_status_check CHECK (((status)::text = ANY ((ARRAY['READY'::character varying, 'FAILED'::character varying, 'EXPIRED'::character varying])::text[]))),
+    CONSTRAINT chk_admin_export_ready CHECK ((((status)::text <> 'READY'::text) OR ((content IS NOT NULL) AND (content_sha256 IS NOT NULL) AND (row_count IS NOT NULL))))
+);
+
+ALTER TABLE ONLY settlement.admin_exports FORCE ROW LEVEL SECURITY;
+
+
+--
+-- Name: TABLE admin_exports; Type: COMMENT; Schema: settlement; Owner: -
+--
+
+COMMENT ON TABLE settlement.admin_exports IS 'CB-7 slice D (D191): administrator CSV exports, kept 24 hours, then cleared by purge_expired_admin_exports().';
+
 
 --
 -- Name: bank_statement_imports; Type: TABLE; Schema: settlement; Owner: -
@@ -357,6 +464,69 @@ ALTER TABLE ONLY settlement.outbox_events FORCE ROW LEVEL SECURITY;
 
 
 --
+-- Name: posting_requests; Type: TABLE; Schema: settlement; Owner: -
+--
+
+CREATE TABLE settlement.posting_requests (
+    id uuid NOT NULL,
+    tenant_id uuid NOT NULL,
+    purpose text NOT NULL,
+    break_id uuid,
+    investigation_id uuid,
+    treatment text NOT NULL,
+    idempotency_key character varying(255) NOT NULL,
+    request_hash character(64) NOT NULL,
+    ledger_idempotency_key character varying(255) NOT NULL,
+    ledger_reference character varying(100) NOT NULL,
+    reason character varying(1500) NOT NULL,
+    note character varying(1000) NOT NULL,
+    currency character(3) NOT NULL,
+    amount_minor bigint NOT NULL,
+    entries jsonb NOT NULL,
+    approval_id uuid NOT NULL,
+    status text DEFAULT 'PENDING'::text NOT NULL,
+    failure_code character varying(100),
+    ledger_adjustment_id uuid,
+    ledger_transaction_id uuid,
+    requested_by uuid NOT NULL,
+    correlation_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    completed_at timestamp with time zone,
+    CONSTRAINT chk_posting_request_outcome CHECK (
+CASE status
+    WHEN 'PENDING'::text THEN ((completed_at IS NULL) AND (failure_code IS NULL) AND (ledger_adjustment_id IS NULL) AND (ledger_transaction_id IS NULL))
+    WHEN 'COMPLETED'::text THEN ((completed_at IS NOT NULL) AND (failure_code IS NULL) AND (ledger_adjustment_id IS NOT NULL) AND (ledger_transaction_id IS NOT NULL))
+    WHEN 'FAILED'::text THEN ((completed_at IS NOT NULL) AND (failure_code IS NOT NULL) AND (ledger_adjustment_id IS NULL) AND (ledger_transaction_id IS NULL))
+    ELSE NULL::boolean
+END),
+    CONSTRAINT chk_posting_request_target CHECK (
+CASE purpose
+    WHEN 'BREAK'::text THEN ((break_id IS NOT NULL) AND (investigation_id IS NULL) AND (treatment <> 'SUSPENSE_RELEASE'::text))
+    WHEN 'SUSPENSE_RELEASE'::text THEN ((investigation_id IS NOT NULL) AND (break_id IS NULL) AND (treatment = 'SUSPENSE_RELEASE'::text))
+    ELSE NULL::boolean
+END),
+    CONSTRAINT posting_requests_amount_minor_check CHECK (((amount_minor >= 1) AND (amount_minor <= '999999999999999'::bigint))),
+    CONSTRAINT posting_requests_currency_check CHECK ((currency ~ '^[A-Z]{3}$'::text)),
+    CONSTRAINT posting_requests_entries_check CHECK (((jsonb_typeof(entries) = 'array'::text) AND (jsonb_array_length(entries) = 2))),
+    CONSTRAINT posting_requests_idempotency_key_check CHECK ((length((idempotency_key)::text) > 0)),
+    CONSTRAINT posting_requests_note_check CHECK ((length(TRIM(BOTH FROM note)) >= 10)),
+    CONSTRAINT posting_requests_purpose_check CHECK ((purpose = ANY (ARRAY['BREAK'::text, 'SUSPENSE_RELEASE'::text]))),
+    CONSTRAINT posting_requests_request_hash_check CHECK ((request_hash ~ '^[a-f0-9]{64}$'::text)),
+    CONSTRAINT posting_requests_status_check CHECK ((status = ANY (ARRAY['PENDING'::text, 'COMPLETED'::text, 'FAILED'::text]))),
+    CONSTRAINT posting_requests_treatment_check CHECK ((treatment = ANY (ARRAY['SUSPENSE'::text, 'PROVIDER_CHARGE'::text, 'WRITE_OFF'::text, 'SUSPENSE_RELEASE'::text])))
+);
+
+ALTER TABLE ONLY settlement.posting_requests FORCE ROW LEVEL SECURITY;
+
+
+--
+-- Name: TABLE posting_requests; Type: COMMENT; Schema: settlement; Owner: -
+--
+
+COMMENT ON TABLE settlement.posting_requests IS 'CB-7 slice B (D185): an approved Ledger manual adjustment settlement requested. The stored journal is what every retry posts, under the same Ledger key.';
+
+
+--
 -- Name: reconciliation_breaks; Type: TABLE; Schema: settlement; Owner: -
 --
 
@@ -446,13 +616,24 @@ CREATE TABLE settlement.reconciliation_resolutions (
     resolved_by uuid,
     correlation_id uuid NOT NULL,
     resolved_at timestamp with time zone DEFAULT now() NOT NULL,
+    treatment text,
+    amount_minor bigint,
+    currency character(3),
+    approval_id uuid,
+    posting_request_id uuid,
+    ledger_adjustment_id uuid,
+    ledger_transaction_id uuid,
+    CONSTRAINT chk_reconciliation_resolution_posting CHECK ((((resolution_type = 'ADJUSTMENT_POSTED'::text) = (posting_request_id IS NOT NULL)) AND ((resolution_type <> 'ADJUSTMENT_POSTED'::text) OR ((treatment IS NOT NULL) AND (amount_minor IS NOT NULL) AND (currency IS NOT NULL) AND (approval_id IS NOT NULL) AND (ledger_adjustment_id IS NOT NULL) AND (ledger_transaction_id IS NOT NULL))) AND ((resolution_type = 'ADJUSTMENT_POSTED'::text) OR ((treatment IS NULL) AND (amount_minor IS NULL) AND (currency IS NULL) AND (approval_id IS NULL) AND (ledger_adjustment_id IS NULL) AND (ledger_transaction_id IS NULL))))),
     CONSTRAINT chk_reconciliation_resolution_shape CHECK (
 CASE resolution_type
     WHEN 'LATE_MATCH'::text THEN ((match_id IS NOT NULL) AND (run_id IS NOT NULL) AND (resolved_by IS NULL))
     WHEN 'RECLASSIFIED'::text THEN ((replacement_break_id IS NOT NULL) AND (run_id IS NOT NULL) AND (resolved_by IS NULL))
     ELSE ((resolved_by IS NOT NULL) AND (note IS NOT NULL) AND (length(TRIM(BOTH FROM note)) >= 10) AND (match_id IS NULL) AND (replacement_break_id IS NULL))
 END),
-    CONSTRAINT reconciliation_resolutions_resolution_type_check CHECK ((resolution_type = ANY (ARRAY['LATE_MATCH'::text, 'RECLASSIFIED'::text, 'WRITE_OFF_NO_IMPACT'::text, 'PROVIDER_CONFIRMED'::text, 'DUPLICATE_ACKNOWLEDGED'::text, 'OTHER'::text])))
+    CONSTRAINT reconciliation_resolutions_amount_minor_check CHECK (((amount_minor >= 1) AND (amount_minor <= '999999999999999'::bigint))),
+    CONSTRAINT reconciliation_resolutions_currency_check CHECK ((currency ~ '^[A-Z]{3}$'::text)),
+    CONSTRAINT reconciliation_resolutions_resolution_type_check CHECK ((resolution_type = ANY (ARRAY['LATE_MATCH'::text, 'RECLASSIFIED'::text, 'WRITE_OFF_NO_IMPACT'::text, 'PROVIDER_CONFIRMED'::text, 'DUPLICATE_ACKNOWLEDGED'::text, 'OTHER'::text, 'ADJUSTMENT_POSTED'::text]))),
+    CONSTRAINT reconciliation_resolutions_treatment_check CHECK ((treatment = ANY (ARRAY['SUSPENSE'::text, 'PROVIDER_CHARGE'::text, 'WRITE_OFF'::text])))
 );
 
 ALTER TABLE ONLY settlement.reconciliation_resolutions FORCE ROW LEVEL SECURITY;
@@ -462,7 +643,7 @@ ALTER TABLE ONLY settlement.reconciliation_resolutions FORCE ROW LEVEL SECURITY;
 -- Name: TABLE reconciliation_resolutions; Type: COMMENT; Schema: settlement; Owner: -
 --
 
-COMMENT ON TABLE settlement.reconciliation_resolutions IS 'CB-7 slice A (D182, D183): how a break was closed. Automatic (late match, reclassified by a later run) or by an administrator with a reason; no postings in slice A.';
+COMMENT ON TABLE settlement.reconciliation_resolutions IS 'CB-7 slices A and B (D182, D183, D185): how a break was closed. Automatic (late match, reclassified), by an administrator with a reason and no posting, or ADJUSTMENT_POSTED through an approved Ledger adjustment.';
 
 
 --
@@ -571,6 +752,88 @@ COMMENT ON TABLE settlement.settlement_participants IS 'CB-7 slice A (D181): pro
 
 
 --
+-- Name: suspense_investigation_notes; Type: TABLE; Schema: settlement; Owner: -
+--
+
+CREATE TABLE settlement.suspense_investigation_notes (
+    id uuid NOT NULL,
+    tenant_id uuid NOT NULL,
+    investigation_id uuid NOT NULL,
+    note character varying(2000) NOT NULL,
+    author_id uuid NOT NULL,
+    correlation_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT suspense_investigation_notes_note_check CHECK ((length(TRIM(BOTH FROM note)) > 0))
+);
+
+ALTER TABLE ONLY settlement.suspense_investigation_notes FORCE ROW LEVEL SECURITY;
+
+
+--
+-- Name: suspense_investigations; Type: TABLE; Schema: settlement; Owner: -
+--
+
+CREATE TABLE settlement.suspense_investigations (
+    id uuid NOT NULL,
+    tenant_id uuid NOT NULL,
+    participant_id uuid NOT NULL,
+    break_id uuid NOT NULL,
+    opening_resolution_id uuid NOT NULL,
+    opening_posting_request_id uuid NOT NULL,
+    side text NOT NULL,
+    amount_minor bigint NOT NULL,
+    currency character(3) NOT NULL,
+    opening_ledger_transaction_id uuid NOT NULL,
+    status text DEFAULT 'OPEN'::text NOT NULL,
+    closure_type text,
+    closing_posting_request_id uuid,
+    closing_ledger_transaction_id uuid,
+    closing_note character varying(1000),
+    closed_by uuid,
+    closed_at timestamp with time zone,
+    opened_by uuid NOT NULL,
+    opened_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT chk_suspense_investigation_closed CHECK (
+CASE status
+    WHEN 'OPEN'::text THEN ((closure_type IS NULL) AND (closing_posting_request_id IS NULL) AND (closing_ledger_transaction_id IS NULL) AND (closing_note IS NULL) AND (closed_by IS NULL) AND (closed_at IS NULL))
+    WHEN 'CLOSED'::text THEN ((closure_type IS NOT NULL) AND (closing_ledger_transaction_id IS NOT NULL) AND (closing_note IS NOT NULL) AND (length(TRIM(BOTH FROM closing_note)) >= 10) AND (closed_by IS NOT NULL) AND (closed_at IS NOT NULL) AND ((closure_type = 'RELEASED'::text) = (closing_posting_request_id IS NOT NULL)))
+    ELSE NULL::boolean
+END),
+    CONSTRAINT chk_suspense_investigation_closing_journal CHECK ((closing_ledger_transaction_id IS DISTINCT FROM opening_ledger_transaction_id)),
+    CONSTRAINT suspense_investigations_amount_minor_check CHECK (((amount_minor >= 1) AND (amount_minor <= '999999999999999'::bigint))),
+    CONSTRAINT suspense_investigations_closure_type_check CHECK ((closure_type = ANY (ARRAY['RELEASED'::text, 'CLEARED_BY_JOURNAL'::text]))),
+    CONSTRAINT suspense_investigations_currency_check CHECK ((currency ~ '^[A-Z]{3}$'::text)),
+    CONSTRAINT suspense_investigations_side_check CHECK ((side = ANY (ARRAY['CREDIT'::text, 'DEBIT'::text]))),
+    CONSTRAINT suspense_investigations_status_check CHECK ((status = ANY (ARRAY['OPEN'::text, 'CLOSED'::text])))
+);
+
+ALTER TABLE ONLY settlement.suspense_investigations FORCE ROW LEVEL SECURITY;
+
+
+--
+-- Name: TABLE suspense_investigations; Type: COMMENT; Schema: settlement; Owner: -
+--
+
+COMMENT ON TABLE settlement.suspense_investigations IS 'CB-7 slice B (D188): money a SUSPENSE posting parked. CREDIT when suspense was credited. Closed by an approved release posting or by linking an exact Ledger journal posted elsewhere.';
+
+
+--
+-- Name: admin_export_downloads admin_export_downloads_pkey; Type: CONSTRAINT; Schema: settlement; Owner: -
+--
+
+ALTER TABLE ONLY settlement.admin_export_downloads
+    ADD CONSTRAINT admin_export_downloads_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: admin_exports admin_exports_pkey; Type: CONSTRAINT; Schema: settlement; Owner: -
+--
+
+ALTER TABLE ONLY settlement.admin_exports
+    ADD CONSTRAINT admin_exports_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: bank_statement_imports bank_statement_imports_pkey; Type: CONSTRAINT; Schema: settlement; Owner: -
 --
 
@@ -627,6 +890,14 @@ ALTER TABLE ONLY settlement.outbox_events
 
 
 --
+-- Name: posting_requests posting_requests_pkey; Type: CONSTRAINT; Schema: settlement; Owner: -
+--
+
+ALTER TABLE ONLY settlement.posting_requests
+    ADD CONSTRAINT posting_requests_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: reconciliation_breaks reconciliation_breaks_pkey; Type: CONSTRAINT; Schema: settlement; Owner: -
 --
 
@@ -672,6 +943,38 @@ ALTER TABLE ONLY settlement.reconciliation_runs
 
 ALTER TABLE ONLY settlement.settlement_participants
     ADD CONSTRAINT settlement_participants_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: suspense_investigation_notes suspense_investigation_notes_pkey; Type: CONSTRAINT; Schema: settlement; Owner: -
+--
+
+ALTER TABLE ONLY settlement.suspense_investigation_notes
+    ADD CONSTRAINT suspense_investigation_notes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: suspense_investigations suspense_investigations_pkey; Type: CONSTRAINT; Schema: settlement; Owner: -
+--
+
+ALTER TABLE ONLY settlement.suspense_investigations
+    ADD CONSTRAINT suspense_investigations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: admin_exports uq_admin_export_idempotency; Type: CONSTRAINT; Schema: settlement; Owner: -
+--
+
+ALTER TABLE ONLY settlement.admin_exports
+    ADD CONSTRAINT uq_admin_export_idempotency UNIQUE (tenant_id, idempotency_key);
+
+
+--
+-- Name: admin_exports uq_admin_export_tenant_id; Type: CONSTRAINT; Schema: settlement; Owner: -
+--
+
+ALTER TABLE ONLY settlement.admin_exports
+    ADD CONSTRAINT uq_admin_export_tenant_id UNIQUE (tenant_id, id);
 
 
 --
@@ -723,6 +1026,30 @@ ALTER TABLE ONLY settlement.settlement_participants
 
 
 --
+-- Name: posting_requests uq_posting_request_key; Type: CONSTRAINT; Schema: settlement; Owner: -
+--
+
+ALTER TABLE ONLY settlement.posting_requests
+    ADD CONSTRAINT uq_posting_request_key UNIQUE (tenant_id, idempotency_key);
+
+
+--
+-- Name: posting_requests uq_posting_request_ledger_key; Type: CONSTRAINT; Schema: settlement; Owner: -
+--
+
+ALTER TABLE ONLY settlement.posting_requests
+    ADD CONSTRAINT uq_posting_request_ledger_key UNIQUE (tenant_id, ledger_idempotency_key);
+
+
+--
+-- Name: posting_requests uq_posting_request_tenant_id; Type: CONSTRAINT; Schema: settlement; Owner: -
+--
+
+ALTER TABLE ONLY settlement.posting_requests
+    ADD CONSTRAINT uq_posting_request_tenant_id UNIQUE (tenant_id, id);
+
+
+--
 -- Name: reconciliation_breaks uq_reconciliation_break_tenant_id; Type: CONSTRAINT; Schema: settlement; Owner: -
 --
 
@@ -760,6 +1087,14 @@ ALTER TABLE ONLY settlement.reconciliation_matches
 
 ALTER TABLE ONLY settlement.reconciliation_resolutions
     ADD CONSTRAINT uq_reconciliation_resolution_break UNIQUE (tenant_id, break_id);
+
+
+--
+-- Name: reconciliation_resolutions uq_reconciliation_resolution_posting; Type: CONSTRAINT; Schema: settlement; Owner: -
+--
+
+ALTER TABLE ONLY settlement.reconciliation_resolutions
+    ADD CONSTRAINT uq_reconciliation_resolution_posting UNIQUE (tenant_id, posting_request_id);
 
 
 --
@@ -843,6 +1178,51 @@ ALTER TABLE ONLY settlement.bank_statement_lines
 
 
 --
+-- Name: suspense_investigations uq_suspense_investigation_break; Type: CONSTRAINT; Schema: settlement; Owner: -
+--
+
+ALTER TABLE ONLY settlement.suspense_investigations
+    ADD CONSTRAINT uq_suspense_investigation_break UNIQUE (tenant_id, break_id);
+
+
+--
+-- Name: suspense_investigations uq_suspense_investigation_closing_journal; Type: CONSTRAINT; Schema: settlement; Owner: -
+--
+
+ALTER TABLE ONLY settlement.suspense_investigations
+    ADD CONSTRAINT uq_suspense_investigation_closing_journal UNIQUE (tenant_id, closing_ledger_transaction_id);
+
+
+--
+-- Name: suspense_investigations uq_suspense_investigation_tenant_id; Type: CONSTRAINT; Schema: settlement; Owner: -
+--
+
+ALTER TABLE ONLY settlement.suspense_investigations
+    ADD CONSTRAINT uq_suspense_investigation_tenant_id UNIQUE (tenant_id, id);
+
+
+--
+-- Name: idx_admin_export_downloads_export; Type: INDEX; Schema: settlement; Owner: -
+--
+
+CREATE INDEX idx_admin_export_downloads_export ON settlement.admin_export_downloads USING btree (tenant_id, export_id, downloaded_at);
+
+
+--
+-- Name: idx_admin_exports_expiry; Type: INDEX; Schema: settlement; Owner: -
+--
+
+CREATE INDEX idx_admin_exports_expiry ON settlement.admin_exports USING btree (expires_at) WHERE ((status)::text = 'READY'::text);
+
+
+--
+-- Name: idx_admin_exports_tenant; Type: INDEX; Schema: settlement; Owner: -
+--
+
+CREATE INDEX idx_admin_exports_tenant ON settlement.admin_exports USING btree (tenant_id, created_at DESC, id DESC);
+
+
+--
 -- Name: idx_expected_item_open; Type: INDEX; Schema: settlement; Owner: -
 --
 
@@ -892,10 +1272,52 @@ CREATE INDEX idx_statement_line_value_date ON settlement.bank_statement_lines US
 
 
 --
+-- Name: idx_suspense_investigation_status; Type: INDEX; Schema: settlement; Owner: -
+--
+
+CREATE INDEX idx_suspense_investigation_status ON settlement.suspense_investigations USING btree (tenant_id, status, opened_at DESC);
+
+
+--
+-- Name: idx_suspense_note_investigation; Type: INDEX; Schema: settlement; Owner: -
+--
+
+CREATE INDEX idx_suspense_note_investigation ON settlement.suspense_investigation_notes USING btree (tenant_id, investigation_id, created_at);
+
+
+--
 -- Name: uq_outbox_aggregate_fact; Type: INDEX; Schema: settlement; Owner: -
 --
 
 CREATE UNIQUE INDEX uq_outbox_aggregate_fact ON settlement.outbox_events USING btree (tenant_id, aggregate_type, aggregate_id, event_type, aggregate_version);
+
+
+--
+-- Name: uq_posting_request_completed_break; Type: INDEX; Schema: settlement; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_posting_request_completed_break ON settlement.posting_requests USING btree (tenant_id, break_id) WHERE ((status = 'COMPLETED'::text) AND (break_id IS NOT NULL));
+
+
+--
+-- Name: uq_posting_request_completed_investigation; Type: INDEX; Schema: settlement; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_posting_request_completed_investigation ON settlement.posting_requests USING btree (tenant_id, investigation_id) WHERE ((status = 'COMPLETED'::text) AND (investigation_id IS NOT NULL));
+
+
+--
+-- Name: uq_posting_request_pending_break; Type: INDEX; Schema: settlement; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_posting_request_pending_break ON settlement.posting_requests USING btree (tenant_id, break_id) WHERE ((status = 'PENDING'::text) AND (break_id IS NOT NULL));
+
+
+--
+-- Name: uq_posting_request_pending_investigation; Type: INDEX; Schema: settlement; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_posting_request_pending_investigation ON settlement.posting_requests USING btree (tenant_id, investigation_id) WHERE ((status = 'PENDING'::text) AND (investigation_id IS NOT NULL));
 
 
 --
@@ -910,6 +1332,13 @@ CREATE UNIQUE INDEX uq_reconciliation_break_open_item ON settlement.reconciliati
 --
 
 CREATE UNIQUE INDEX uq_reconciliation_break_open_line ON settlement.reconciliation_breaks USING btree (tenant_id, statement_line_id) WHERE ((status = 'OPEN'::text) AND (statement_line_id IS NOT NULL));
+
+
+--
+-- Name: admin_export_downloads append_only; Type: TRIGGER; Schema: settlement; Owner: -
+--
+
+CREATE TRIGGER append_only BEFORE DELETE OR UPDATE ON settlement.admin_export_downloads FOR EACH ROW EXECUTE FUNCTION settlement.reject_mutation();
 
 
 --
@@ -969,10 +1398,24 @@ CREATE TRIGGER append_only BEFORE DELETE OR UPDATE ON settlement.reconciliation_
 
 
 --
+-- Name: suspense_investigation_notes append_only; Type: TRIGGER; Schema: settlement; Owner: -
+--
+
+CREATE TRIGGER append_only BEFORE DELETE OR UPDATE ON settlement.suspense_investigation_notes FOR EACH ROW EXECUTE FUNCTION settlement.reject_mutation();
+
+
+--
 -- Name: expected_items guard_columns; Type: TRIGGER; Schema: settlement; Owner: -
 --
 
 CREATE TRIGGER guard_columns BEFORE DELETE OR UPDATE ON settlement.expected_items FOR EACH ROW EXECUTE FUNCTION settlement.guard_columns('status', 'matched_at', 'reversed_at', 'reversal_ledger_transaction_id', 'updated_at');
+
+
+--
+-- Name: posting_requests guard_columns; Type: TRIGGER; Schema: settlement; Owner: -
+--
+
+CREATE TRIGGER guard_columns BEFORE DELETE OR UPDATE ON settlement.posting_requests FOR EACH ROW EXECUTE FUNCTION settlement.guard_columns('status', 'failure_code', 'ledger_adjustment_id', 'ledger_transaction_id', 'completed_at');
 
 
 --
@@ -997,10 +1440,24 @@ CREATE TRIGGER guard_columns BEFORE DELETE OR UPDATE ON settlement.settlement_pa
 
 
 --
+-- Name: suspense_investigations guard_columns; Type: TRIGGER; Schema: settlement; Owner: -
+--
+
+CREATE TRIGGER guard_columns BEFORE DELETE OR UPDATE ON settlement.suspense_investigations FOR EACH ROW EXECUTE FUNCTION settlement.guard_columns('status', 'closure_type', 'closing_posting_request_id', 'closing_ledger_transaction_id', 'closing_note', 'closed_by', 'closed_at');
+
+
+--
 -- Name: expected_items guard_transition; Type: TRIGGER; Schema: settlement; Owner: -
 --
 
 CREATE TRIGGER guard_transition BEFORE UPDATE ON settlement.expected_items FOR EACH ROW EXECUTE FUNCTION settlement.guard_expected_item();
+
+
+--
+-- Name: posting_requests guard_transition; Type: TRIGGER; Schema: settlement; Owner: -
+--
+
+CREATE TRIGGER guard_transition BEFORE UPDATE ON settlement.posting_requests FOR EACH ROW EXECUTE FUNCTION settlement.guard_posting_request();
 
 
 --
@@ -1015,6 +1472,29 @@ CREATE TRIGGER guard_transition BEFORE UPDATE ON settlement.reconciliation_break
 --
 
 CREATE TRIGGER guard_transition BEFORE UPDATE ON settlement.reconciliation_runs FOR EACH ROW EXECUTE FUNCTION settlement.guard_run();
+
+
+--
+-- Name: suspense_investigations guard_transition; Type: TRIGGER; Schema: settlement; Owner: -
+--
+
+CREATE TRIGGER guard_transition BEFORE UPDATE ON settlement.suspense_investigations FOR EACH ROW EXECUTE FUNCTION settlement.guard_suspense_investigation();
+
+
+--
+-- Name: admin_export_downloads fk_admin_export_download; Type: FK CONSTRAINT; Schema: settlement; Owner: -
+--
+
+ALTER TABLE ONLY settlement.admin_export_downloads
+    ADD CONSTRAINT fk_admin_export_download FOREIGN KEY (tenant_id, export_id) REFERENCES settlement.admin_exports(tenant_id, id);
+
+
+--
+-- Name: posting_requests fk_posting_request_break; Type: FK CONSTRAINT; Schema: settlement; Owner: -
+--
+
+ALTER TABLE ONLY settlement.posting_requests
+    ADD CONSTRAINT fk_posting_request_break FOREIGN KEY (tenant_id, break_id) REFERENCES settlement.reconciliation_breaks(tenant_id, id);
 
 
 --
@@ -1090,6 +1570,14 @@ ALTER TABLE ONLY settlement.reconciliation_resolutions
 
 
 --
+-- Name: reconciliation_resolutions fk_reconciliation_resolution_posting; Type: FK CONSTRAINT; Schema: settlement; Owner: -
+--
+
+ALTER TABLE ONLY settlement.reconciliation_resolutions
+    ADD CONSTRAINT fk_reconciliation_resolution_posting FOREIGN KEY (tenant_id, posting_request_id) REFERENCES settlement.posting_requests(tenant_id, id);
+
+
+--
 -- Name: reconciliation_resolutions fk_reconciliation_resolution_replacement; Type: FK CONSTRAINT; Schema: settlement; Owner: -
 --
 
@@ -1146,11 +1634,92 @@ ALTER TABLE ONLY settlement.bank_statement_lines
 
 
 --
+-- Name: suspense_investigations fk_suspense_investigation_break; Type: FK CONSTRAINT; Schema: settlement; Owner: -
+--
+
+ALTER TABLE ONLY settlement.suspense_investigations
+    ADD CONSTRAINT fk_suspense_investigation_break FOREIGN KEY (tenant_id, break_id) REFERENCES settlement.reconciliation_breaks(tenant_id, id);
+
+
+--
+-- Name: suspense_investigations fk_suspense_investigation_closing; Type: FK CONSTRAINT; Schema: settlement; Owner: -
+--
+
+ALTER TABLE ONLY settlement.suspense_investigations
+    ADD CONSTRAINT fk_suspense_investigation_closing FOREIGN KEY (tenant_id, closing_posting_request_id) REFERENCES settlement.posting_requests(tenant_id, id);
+
+
+--
+-- Name: suspense_investigations fk_suspense_investigation_opening; Type: FK CONSTRAINT; Schema: settlement; Owner: -
+--
+
+ALTER TABLE ONLY settlement.suspense_investigations
+    ADD CONSTRAINT fk_suspense_investigation_opening FOREIGN KEY (tenant_id, opening_posting_request_id) REFERENCES settlement.posting_requests(tenant_id, id);
+
+
+--
+-- Name: suspense_investigations fk_suspense_investigation_participant; Type: FK CONSTRAINT; Schema: settlement; Owner: -
+--
+
+ALTER TABLE ONLY settlement.suspense_investigations
+    ADD CONSTRAINT fk_suspense_investigation_participant FOREIGN KEY (tenant_id, participant_id) REFERENCES settlement.settlement_participants(tenant_id, id);
+
+
+--
+-- Name: suspense_investigations fk_suspense_investigation_resolution; Type: FK CONSTRAINT; Schema: settlement; Owner: -
+--
+
+ALTER TABLE ONLY settlement.suspense_investigations
+    ADD CONSTRAINT fk_suspense_investigation_resolution FOREIGN KEY (tenant_id, opening_resolution_id) REFERENCES settlement.reconciliation_resolutions(tenant_id, id);
+
+
+--
+-- Name: suspense_investigation_notes fk_suspense_note_investigation; Type: FK CONSTRAINT; Schema: settlement; Owner: -
+--
+
+ALTER TABLE ONLY settlement.suspense_investigation_notes
+    ADD CONSTRAINT fk_suspense_note_investigation FOREIGN KEY (tenant_id, investigation_id) REFERENCES settlement.suspense_investigations(tenant_id, id);
+
+
+--
 -- Name: reconciliation_runs reconciliation_runs_rule_set_version_fkey; Type: FK CONSTRAINT; Schema: settlement; Owner: -
 --
 
 ALTER TABLE ONLY settlement.reconciliation_runs
     ADD CONSTRAINT reconciliation_runs_rule_set_version_fkey FOREIGN KEY (rule_set_version) REFERENCES settlement.reconciliation_rules(version);
+
+
+--
+-- Name: admin_export_downloads; Type: ROW SECURITY; Schema: settlement; Owner: -
+--
+
+ALTER TABLE settlement.admin_export_downloads ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: admin_export_downloads admin_export_downloads_tenant_policy; Type: POLICY; Schema: settlement; Owner: -
+--
+
+CREATE POLICY admin_export_downloads_tenant_policy ON settlement.admin_export_downloads USING ((tenant_id = (NULLIF(current_setting('app.current_tenant_id'::text, true), ''::text))::uuid)) WITH CHECK ((tenant_id = (NULLIF(current_setting('app.current_tenant_id'::text, true), ''::text))::uuid));
+
+
+--
+-- Name: admin_exports; Type: ROW SECURITY; Schema: settlement; Owner: -
+--
+
+ALTER TABLE settlement.admin_exports ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: admin_exports admin_exports_purge_owner; Type: POLICY; Schema: settlement; Owner: -
+--
+
+CREATE POLICY admin_exports_purge_owner ON settlement.admin_exports TO parc_settlement_migrator USING (true) WITH CHECK (true);
+
+
+--
+-- Name: admin_exports admin_exports_tenant_policy; Type: POLICY; Schema: settlement; Owner: -
+--
+
+CREATE POLICY admin_exports_tenant_policy ON settlement.admin_exports USING ((tenant_id = (NULLIF(current_setting('app.current_tenant_id'::text, true), ''::text))::uuid)) WITH CHECK ((tenant_id = (NULLIF(current_setting('app.current_tenant_id'::text, true), ''::text))::uuid));
 
 
 --
@@ -1252,6 +1821,19 @@ CREATE POLICY outbox_tenant_discovery_owner_read ON settlement.outbox_events FOR
 
 
 --
+-- Name: posting_requests; Type: ROW SECURITY; Schema: settlement; Owner: -
+--
+
+ALTER TABLE settlement.posting_requests ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: posting_requests posting_requests_tenant_policy; Type: POLICY; Schema: settlement; Owner: -
+--
+
+CREATE POLICY posting_requests_tenant_policy ON settlement.posting_requests USING ((tenant_id = (NULLIF(current_setting('app.current_tenant_id'::text, true), ''::text))::uuid)) WITH CHECK ((tenant_id = (NULLIF(current_setting('app.current_tenant_id'::text, true), ''::text))::uuid));
+
+
+--
 -- Name: reconciliation_breaks; Type: ROW SECURITY; Schema: settlement; Owner: -
 --
 
@@ -1317,6 +1899,32 @@ CREATE POLICY settlement_participants_tenant_policy ON settlement.settlement_par
 
 
 --
+-- Name: suspense_investigation_notes; Type: ROW SECURITY; Schema: settlement; Owner: -
+--
+
+ALTER TABLE settlement.suspense_investigation_notes ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: suspense_investigation_notes suspense_investigation_notes_tenant_policy; Type: POLICY; Schema: settlement; Owner: -
+--
+
+CREATE POLICY suspense_investigation_notes_tenant_policy ON settlement.suspense_investigation_notes USING ((tenant_id = (NULLIF(current_setting('app.current_tenant_id'::text, true), ''::text))::uuid)) WITH CHECK ((tenant_id = (NULLIF(current_setting('app.current_tenant_id'::text, true), ''::text))::uuid));
+
+
+--
+-- Name: suspense_investigations; Type: ROW SECURITY; Schema: settlement; Owner: -
+--
+
+ALTER TABLE settlement.suspense_investigations ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: suspense_investigations suspense_investigations_tenant_policy; Type: POLICY; Schema: settlement; Owner: -
+--
+
+CREATE POLICY suspense_investigations_tenant_policy ON settlement.suspense_investigations USING ((tenant_id = (NULLIF(current_setting('app.current_tenant_id'::text, true), ''::text))::uuid)) WITH CHECK ((tenant_id = (NULLIF(current_setting('app.current_tenant_id'::text, true), ''::text))::uuid));
+
+
+--
 -- Name: SCHEMA settlement; Type: ACL; Schema: -; Owner: -
 --
 
@@ -1331,6 +1939,30 @@ GRANT USAGE ON SCHEMA settlement TO parc_settlement_readonly;
 
 REVOKE ALL ON FUNCTION settlement.outbox_tenants_with_work() FROM PUBLIC;
 GRANT ALL ON FUNCTION settlement.outbox_tenants_with_work() TO parc_settlement_worker;
+
+
+--
+-- Name: FUNCTION purge_expired_admin_exports(); Type: ACL; Schema: settlement; Owner: -
+--
+
+REVOKE ALL ON FUNCTION settlement.purge_expired_admin_exports() FROM PUBLIC;
+GRANT ALL ON FUNCTION settlement.purge_expired_admin_exports() TO parc_settlement_worker;
+
+
+--
+-- Name: TABLE admin_export_downloads; Type: ACL; Schema: settlement; Owner: -
+--
+
+GRANT SELECT ON TABLE settlement.admin_export_downloads TO parc_settlement_readonly;
+GRANT SELECT,INSERT ON TABLE settlement.admin_export_downloads TO parc_settlement_runtime;
+
+
+--
+-- Name: TABLE admin_exports; Type: ACL; Schema: settlement; Owner: -
+--
+
+GRANT SELECT ON TABLE settlement.admin_exports TO parc_settlement_readonly;
+GRANT SELECT,INSERT ON TABLE settlement.admin_exports TO parc_settlement_runtime;
 
 
 --
@@ -1393,6 +2025,14 @@ GRANT SELECT,INSERT,UPDATE ON TABLE settlement.outbox_events TO parc_settlement_
 
 
 --
+-- Name: TABLE posting_requests; Type: ACL; Schema: settlement; Owner: -
+--
+
+GRANT SELECT ON TABLE settlement.posting_requests TO parc_settlement_readonly;
+GRANT SELECT,INSERT,UPDATE ON TABLE settlement.posting_requests TO parc_settlement_runtime;
+
+
+--
 -- Name: TABLE reconciliation_breaks; Type: ACL; Schema: settlement; Owner: -
 --
 
@@ -1440,6 +2080,22 @@ GRANT SELECT,INSERT,UPDATE ON TABLE settlement.reconciliation_runs TO parc_settl
 GRANT SELECT ON TABLE settlement.settlement_participants TO parc_settlement_readonly;
 GRANT SELECT,INSERT,UPDATE ON TABLE settlement.settlement_participants TO parc_settlement_runtime;
 GRANT SELECT ON TABLE settlement.settlement_participants TO parc_settlement_worker;
+
+
+--
+-- Name: TABLE suspense_investigation_notes; Type: ACL; Schema: settlement; Owner: -
+--
+
+GRANT SELECT ON TABLE settlement.suspense_investigation_notes TO parc_settlement_readonly;
+GRANT SELECT,INSERT ON TABLE settlement.suspense_investigation_notes TO parc_settlement_runtime;
+
+
+--
+-- Name: TABLE suspense_investigations; Type: ACL; Schema: settlement; Owner: -
+--
+
+GRANT SELECT ON TABLE settlement.suspense_investigations TO parc_settlement_readonly;
+GRANT SELECT,INSERT,UPDATE ON TABLE settlement.suspense_investigations TO parc_settlement_runtime;
 
 
 --

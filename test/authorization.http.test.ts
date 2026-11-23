@@ -6,6 +6,9 @@ import { createApp } from "../src/app.js";
 import { StatementStoreUnavailableError } from "../src/runtime/statement-store.js";
 import { createParcAuth } from "../src/security/parc-service-auth.js";
 import type { SettlementReadService } from "../src/services/read-service.js";
+import type { SettlementAdminService } from "../src/services/admin-reports.js";
+import type { AdminExportService } from "../src/services/export-service.js";
+import type { PostingService } from "../src/services/posting-service.js";
 import type { ReconciliationService } from "../src/services/reconciliation-service.js";
 import type { StatementService } from "../src/services/statement-service.js";
 import { SettlementError } from "../src/services/support.js";
@@ -41,7 +44,28 @@ describe("settlement-reconciliation routes", () => {
     startRun: jest.fn(() => ok({ id })),
     resolveBreak: jest.fn(() => ok({ break_id: id })),
   };
+  const postings = {
+    previewBreak: jest.fn(() => ok()),
+    postBreak: jest.fn(() => ok({ break_id: id })),
+    previewRelease: jest.fn(() => ok()),
+    release: jest.fn(() => ok({ investigation_id: id })),
+    clearByJournal: jest.fn(() => ok({ investigation_id: id })),
+    addNote: jest.fn(() => ok({ investigation_id: id })),
+  };
+  const settlementAdmin = {
+    summary: jest.fn(() => ok({ tenant_id: tenantId })),
+    report: jest.fn(() => ok()),
+  };
+  const exportsService = {
+    create: jest.fn(() => ok({ id })),
+    list: jest.fn(() => ok({ items: [] })),
+    download: jest.fn(() =>
+      Promise.resolve({ filename: "f.csv", content: "a\r\n", sha256: "x" }),
+    ),
+  };
   const reads = {
+    listInvestigations: jest.fn(page),
+    getInvestigation: jest.fn(() => ok()),
     listImports: jest.fn(page),
     getImport: jest.fn(() => ok()),
     listLines: jest.fn(page),
@@ -74,7 +98,10 @@ describe("settlement-reconciliation routes", () => {
       }),
       statements: statements as unknown as StatementService,
       reconciliation: reconciliation as unknown as ReconciliationService,
+      postings: postings as unknown as PostingService,
       reads: reads as unknown as SettlementReadService,
+      admin: settlementAdmin as unknown as SettlementAdminService,
+      exports: exportsService as unknown as AdminExportService,
     });
   });
   beforeEach(() => jest.clearAllMocks());
@@ -107,6 +134,8 @@ describe("settlement-reconciliation routes", () => {
     `/internal/v1/reconciliation-runs/${id}`,
     "/internal/v1/reconciliation-breaks",
     `/internal/v1/reconciliation-breaks/${id}`,
+    "/internal/v1/suspense-investigations",
+    `/internal/v1/suspense-investigations/${id}`,
   ];
   const commands: [string, string, object][] = [
     [
@@ -142,6 +171,41 @@ describe("settlement-reconciliation routes", () => {
       "post",
       `/internal/v1/reconciliation-breaks/${id}/resolve`,
       { resolution_type: "OTHER", note: "Checked with the provider" },
+    ],
+    // CB-7 slice B (D189): every posting and suspense command needs manage.
+    [
+      "post",
+      `/internal/v1/reconciliation-breaks/${id}/posting-resolutions/preview`,
+      { treatment: "SUSPENSE", note: "Unknown credit from Paystack" },
+    ],
+    [
+      "post",
+      `/internal/v1/reconciliation-breaks/${id}/posting-resolutions`,
+      {
+        treatment: "SUSPENSE",
+        note: "Unknown credit from Paystack",
+        approval_id: id,
+      },
+    ],
+    [
+      "post",
+      `/internal/v1/suspense-investigations/${id}/notes`,
+      { note: "Asked Paystack for the payer" },
+    ],
+    [
+      "post",
+      `/internal/v1/suspense-investigations/${id}/release/preview`,
+      { note: "Unclaimed after 90 days" },
+    ],
+    [
+      "post",
+      `/internal/v1/suspense-investigations/${id}/release`,
+      { note: "Unclaimed after 90 days", approval_id: id },
+    ],
+    [
+      "post",
+      `/internal/v1/suspense-investigations/${id}/clear-by-journal`,
+      { journal_id: id, note: "Refunded by Payment" },
     ],
   ];
   const send = (
@@ -180,6 +244,58 @@ describe("settlement-reconciliation routes", () => {
       expect(denied.status).toBe(403);
     },
   );
+
+  // CB-7 slice D (D191): each admin route needs exactly its own scope.
+  it.each([
+    ["get", "/internal/v1/summary", READ],
+    [
+      "get",
+      "/internal/v1/admin/reports/reconciliation-breaks?from=2026-11-01&to=2026-11-10",
+      "settlement.reports.read",
+    ],
+    ["get", "/internal/v1/admin/exports", "settlement.exports.write"],
+    [
+      "get",
+      `/internal/v1/admin/exports/${id}/download`,
+      "settlement.exports.write",
+    ],
+    ["post", "/internal/v1/admin/exports", "settlement.exports.write"],
+  ] as const)("%s %s needs %s", async (method, path, scope) => {
+    const body = {
+      kind: "reconciliation-breaks",
+      from: "2026-11-01",
+      to: "2026-11-10",
+      reason_code: "RECONCILIATION",
+    };
+    const done = await send(method, path, await administrator(scope), body);
+    expect([200, 201]).toContain(done.status);
+    const other = scope === READ ? MANAGE : READ;
+    expect(
+      (await send(method, path, await administrator(other), body)).status,
+    ).toBe(403);
+  });
+
+  it("refuses an unknown report and a malformed period", async () => {
+    const token = await administrator("settlement.reports.read");
+    expect(
+      (
+        await send(
+          "get",
+          "/internal/v1/admin/reports/nope?from=2026-11-01&to=2026-11-02",
+          token,
+        )
+      ).body,
+    ).toMatchObject({ code: "REPORT_NOT_FOUND" });
+    expect(
+      (
+        await send(
+          "get",
+          "/internal/v1/admin/reports/reconciliation-breaks?from=2026-11-02&to=2026-11-01",
+          token,
+        )
+      ).status,
+    ).toBe(400);
+  });
 
   it("accepts only administrators through the Admin BFF, for their tenant", async () => {
     const path = "/internal/v1/reconciliation-breaks";

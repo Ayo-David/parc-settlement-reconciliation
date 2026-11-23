@@ -111,7 +111,10 @@ describeDatabase("settlement isolation", () => {
         (row) => !row.enabled || !row.forced || row.policies === 0,
       ),
     ).toEqual([]);
-    expect(result.rows.length).toBe(12);
+    // 12 from SET-DB-001, plus posting_requests, suspense_investigations and
+    // suspense_investigation_notes from SET-DB-002 (CB-7 slice B), plus
+    // admin_exports and admin_export_downloads from SET-DB-003 (slice D).
+    expect(result.rows.length).toBe(17);
   });
 
   it("grants no DELETE or TRUNCATE to the runtime, worker or read-only roles", async () => {
@@ -215,7 +218,7 @@ describeDatabase("settlement isolation", () => {
     expect(await outboxTenantsWithWork(database)).toContain(tenantA);
   });
 
-  it("lets only the worker call the discovery function", async () => {
+  it("lets only the worker call the SECURITY DEFINER functions", async () => {
     const result = await admin.raw<{
       rows: {
         fn: string;
@@ -229,11 +232,19 @@ describeDatabase("settlement isolation", () => {
               has_function_privilege('parc_settlement_worker', p.oid, 'EXECUTE') AS worker,
               has_function_privilege('parc_settlement_readonly', p.oid, 'EXECUTE') AS readonly
          FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-        WHERE n.nspname = 'settlement' AND p.prosecdef`,
+        WHERE n.nspname = 'settlement' AND p.prosecdef
+        ORDER BY p.proname`,
     );
     expect(result.rows).toEqual([
       {
         fn: "outbox_tenants_with_work",
+        runtime: false,
+        worker: true,
+        readonly: false,
+      },
+      // CB-7 slice D (SET-DB-003): clears expired export files.
+      {
+        fn: "purge_expired_admin_exports",
         runtime: false,
         worker: true,
         readonly: false,

@@ -6,6 +6,7 @@ import express, {
 } from "express";
 import helmet from "helmet";
 import { z } from "zod";
+import { createAdminRouter } from "./http/admin-router.js";
 import { createSettlementRouter } from "./http/settlement-router.js";
 import { StatementStoreUnavailableError } from "./runtime/statement-store.js";
 import {
@@ -13,6 +14,12 @@ import {
   type AccessPolicy,
 } from "./security/parc-service-auth.js";
 import type { SettlementReadService } from "./services/read-service.js";
+import type { SettlementAdminService } from "./services/admin-reports.js";
+import {
+  type AdminExportService,
+  ExportError,
+} from "./services/export-service.js";
+import type { PostingService } from "./services/posting-service.js";
 import type { ReconciliationService } from "./services/reconciliation-service.js";
 import type { StatementService } from "./services/statement-service.js";
 import { SettlementError } from "./services/support.js";
@@ -25,7 +32,11 @@ export interface SettlementAppInput {
   access: SettlementAccess;
   statements: StatementService;
   reconciliation: ReconciliationService;
+  postings: PostingService;
   reads: SettlementReadService;
+  /** CB-7 slice D (D191): summary, report and exports. */
+  admin: SettlementAdminService;
+  exports: AdminExportService;
   /** Readiness: the database answers. */
   ready?: () => Promise<void>;
 }
@@ -49,7 +60,15 @@ export function createApp(input: SettlementAppInput) {
     createSettlementRouter({
       statements: input.statements,
       reconciliation: input.reconciliation,
+      postings: input.postings,
       reads: input.reads,
+      require: (policy) => input.access.require(policy),
+    }),
+  );
+  app.use(
+    createAdminRouter({
+      admin: input.admin,
+      exports: input.exports,
       require: (policy) => input.access.require(policy),
     }),
   );
@@ -70,6 +89,11 @@ export function createApp(input: SettlementAppInput) {
         return response
           .status(error.status)
           .json({ code: error.code, message: error.message });
+      if (error instanceof ExportError)
+        return response.status(error.status).json({
+          code: error.code,
+          message: "The export request was refused",
+        });
       if (error instanceof SettlementError)
         return response.status(error.status).json({
           code: error.code,

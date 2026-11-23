@@ -6,7 +6,13 @@ import {
   type BreakType,
 } from "./reconciliation-service.js";
 import { importView, type ImportView } from "./statement-service.js";
-import { decodeCursor, encodeCursor, SettlementError } from "./support.js";
+import {
+  daysBetween,
+  decodeCursor,
+  encodeCursor,
+  lagosDate,
+  SettlementError,
+} from "./support.js";
 
 export interface Page<T> {
   items: T[];
@@ -23,7 +29,10 @@ export interface PageQuery {
  * person; they are returned to administrators but never logged.
  */
 export class SettlementReadService {
-  public constructor(private readonly database: Knex) {}
+  public constructor(
+    private readonly database: Knex,
+    private readonly now: () => Date = () => new Date(),
+  ) {}
 
   public listImports(
     tenantId: string,
@@ -236,7 +245,29 @@ export class SettlementReadService {
             "run_id",
             "resolved_by",
             "resolved_at",
+            "treatment",
+            "amount_minor",
+            "ledger_adjustment_id",
+            "ledger_transaction_id",
+            "approval_id",
           )) ?? null;
+      // Slice B: the suspense investigation a SUSPENSE posting opened.
+      const investigation = resolution
+        ? await tx("suspense_investigations")
+            .where({ tenant_id: tenantId, break_id: breakId })
+            .first<{ id: string } | undefined>("id")
+        : undefined;
+      const resolutionView: Record<string, unknown> | null = resolution
+        ? {
+            ...resolution,
+            amount_minor:
+              typeof resolution.amount_minor === "string" ||
+              typeof resolution.amount_minor === "number"
+                ? String(resolution.amount_minor)
+                : null,
+            investigation_id: investigation?.id ?? null,
+          }
+        : null;
       const money = (value: Record<string, unknown> | null | undefined) =>
         value ? { ...value, amount_minor: String(value.amount_minor) } : null;
       return {
@@ -244,9 +275,65 @@ export class SettlementReadService {
         statement_line: money(line),
         expected_item: money(item),
         journal,
-        resolution,
+        resolution: resolutionView,
       };
     });
+  }
+
+  /** CB-7 slice B (D188): suspense investigations, newest first. */
+  public listInvestigations(
+    tenantId: string,
+    query: PageQuery & {
+      status?: "OPEN" | "CLOSED" | undefined;
+      participantId?: string | undefined;
+    },
+  ) {
+    return withTenantTransaction(this.database, tenantId, (tx) => {
+      const builder = this.investigationQuery(tx, tenantId);
+      if (query.status) builder.where("s.status", query.status);
+      if (query.participantId)
+        builder.where("s.participant_id", query.participantId);
+      return page(builder, "s.opened_at", "s.id", query, (row) =>
+        investigationView(row, this.now()),
+      );
+    });
+  }
+
+  public getInvestigation(tenantId: string, investigationId: string) {
+    return withTenantTransaction(this.database, tenantId, async (tx) => {
+      const row = await this.investigationQuery(tx, tenantId)
+        .where("s.id", investigationId)
+        .first<Record<string, unknown> | undefined>();
+      if (!row)
+        throw new SettlementError(
+          404,
+          "INVESTIGATION_NOT_FOUND",
+          "No such investigation",
+        );
+      const notes = await tx("suspense_investigation_notes")
+        .where({ tenant_id: tenantId, investigation_id: investigationId })
+        .orderBy([{ column: "created_at" }, { column: "id" }])
+        .select<
+          { id: string; note: string; author_id: string; created_at: Date }[]
+        >("id", "note", "author_id", "created_at");
+      return {
+        ...investigationView(row, this.now()),
+        closing_note: (row.closing_note as string | null) ?? null,
+        notes: notes.map((note) => ({
+          ...note,
+          created_at: note.created_at.toISOString(),
+        })),
+      };
+    });
+  }
+
+  private investigationQuery(tx: Knex.Transaction, tenantId: string) {
+    return tx("suspense_investigations as s")
+      .join("settlement_participants as p", function () {
+        this.on("p.tenant_id", "s.tenant_id").andOn("p.id", "s.participant_id");
+      })
+      .where("s.tenant_id", tenantId)
+      .select("s.*", "p.code as participant_code");
   }
 
   private importQuery(tx: Knex.Transaction, tenantId: string) {
@@ -323,6 +410,33 @@ function breakView(row: Record<string, unknown>) {
     status: row.status as "OPEN" | "RESOLVED",
     detected_at: at(row.detected_at)!,
     resolved_at: at(row.resolved_at),
+  };
+}
+
+function investigationView(row: Record<string, unknown>, now: Date) {
+  const at = (value: unknown) =>
+    value instanceof Date ? value.toISOString() : null;
+  const opened = row.opened_at as Date;
+  const until = (row.closed_at as Date | null) ?? now;
+  return {
+    id: row.id as string,
+    participant_id: row.participant_id as string,
+    participant_code: row.participant_code as string,
+    break_id: row.break_id as string,
+    side: row.side as "CREDIT" | "DEBIT",
+    amount_minor: String(row.amount_minor),
+    currency: (row.currency as string).trim(),
+    opening_ledger_transaction_id: row.opening_ledger_transaction_id as string,
+    status: row.status as "OPEN" | "CLOSED",
+    closure_type:
+      (row.closure_type as "RELEASED" | "CLEARED_BY_JOURNAL" | null) ?? null,
+    closing_ledger_transaction_id:
+      (row.closing_ledger_transaction_id as string | null) ?? null,
+    opened_by: row.opened_by as string,
+    opened_at: at(opened)!,
+    closed_by: (row.closed_by as string | null) ?? null,
+    closed_at: at(row.closed_at),
+    age_days: Math.max(0, daysBetween(lagosDate(opened), lagosDate(until))),
   };
 }
 

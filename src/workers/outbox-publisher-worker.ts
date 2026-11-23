@@ -5,6 +5,10 @@ import {
   type PublisherLogger,
 } from "../messaging/outbox/outbox-publisher.js";
 import { outboxTenantsWithWork } from "../runtime/outbox-tenants.js";
+import {
+  exportPurgeIntervalMs,
+  purgeExpiredExports,
+} from "../services/export-service.js";
 
 /**
  * CB-7: relays outbox_events (reconciliation.run-started.v1,
@@ -38,6 +42,17 @@ const publisher = new SettlementOutboxPublisher(
   logger,
 );
 
+// CB-7 slice D (D191): clear export files past their 24 hours.
+const purge = () =>
+  purgeExpiredExports(database).then(
+    (purged) => {
+      if (purged > 0) logger.info("Expired exports cleared", { purged });
+    },
+    () => logger.error("Export purge failed", {}),
+  );
+void purge();
+const purgeTimer = setInterval(() => void purge(), exportPurgeIntervalMs);
+
 let stopping = false;
 async function run(): Promise<void> {
   logger.info("Settlement outbox publisher started");
@@ -50,6 +65,7 @@ async function run(): Promise<void> {
         setTimeout(resolve, config.OUTBOX_POLL_MS),
       );
   }
+  clearInterval(purgeTimer);
   await publisher.close();
   await database.destroy();
 }

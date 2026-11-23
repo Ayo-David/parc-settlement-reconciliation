@@ -6,7 +6,10 @@ import { canonicalJson, lagosDate, sha256 } from "./support.js";
 export const TRANSFER_COMPLETED = "payment.transfer-completed.v1";
 export const COLLECTION_CONFIRMED = "payment.collection-confirmed.v1";
 export const BILL_FULFILLED = "payment.bill-fulfilled.v1";
-export const PAYMENT_REVERSED = "payment.payment-reversed.v1";
+// The contracted name (parc-contracts events/payment/payment-reversed/v1.json)
+// and what Payment emits. Until CB-7 slice B this subscribed to a name nothing
+// publishes, so reversals never reached the projection.
+export const PAYMENT_REVERSED = "payment.reversed.v1";
 export const JOURNAL_POSTED = "ledger.transaction-posted.v1";
 export const consumedEvents = [
   TRANSFER_COMPLETED,

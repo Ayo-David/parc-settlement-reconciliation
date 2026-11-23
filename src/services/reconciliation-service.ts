@@ -383,6 +383,15 @@ export class ReconciliationService {
           "BREAK_ALREADY_RESOLVED",
           "The break is already resolved",
         );
+      const pending = await tx("posting_requests")
+        .where({ tenant_id: tenantId, break_id: breakId, status: "PENDING" })
+        .first<{ id: string } | undefined>("id");
+      if (pending)
+        throw new SettlementError(
+          409,
+          "POSTING_IN_PROGRESS",
+          "A posting is pending for this break",
+        );
       if (
         input.resolutionType === "DUPLICATE_ACKNOWLEDGED" &&
         row.break_type !== "DUPLICATE_EXTERNAL"
@@ -469,6 +478,14 @@ export class ReconciliationService {
       .where((query) => {
         query.whereNull("b.id").orWhere("b.break_type", "UNMATCHED_EXTERNAL");
       })
+      // Slice B: a pending posting holds its break until it completes.
+      .whereNotExists(
+        tx("posting_requests as pr")
+          .select(tx.raw("1"))
+          .whereRaw("pr.tenant_id = b.tenant_id")
+          .whereRaw("pr.break_id = b.id")
+          .where("pr.status", "PENDING"),
+      )
       .whereNotExists(
         tx("reconciliation_breaks as closed")
           .select(tx.raw("1"))
@@ -565,10 +582,16 @@ export class ReconciliationService {
                AND b.status = 'OPEN' AND b.break_type = 'MISSING_EXTERNAL') AS open_missing_id`,
         ),
         tx.raw(
-          `EXISTS (SELECT 1 FROM reconciliation_breaks b
-                    WHERE b.tenant_id = e.tenant_id AND b.expected_item_id = e.id
-                      AND NOT (b.status = 'OPEN' AND b.break_type = 'MISSING_EXTERNAL')
-                      AND b.break_type IN ('AMOUNT_MISMATCH','MISSING_EXTERNAL')) AS held`,
+          `(EXISTS (SELECT 1 FROM reconciliation_breaks b
+                     WHERE b.tenant_id = e.tenant_id AND b.expected_item_id = e.id
+                       AND NOT (b.status = 'OPEN' AND b.break_type = 'MISSING_EXTERNAL')
+                       AND b.break_type IN ('AMOUNT_MISMATCH','MISSING_EXTERNAL'))
+            OR EXISTS (SELECT 1 FROM reconciliation_breaks b
+                         JOIN posting_requests pr
+                           ON pr.tenant_id = b.tenant_id AND pr.break_id = b.id
+                          AND pr.status = 'PENDING'
+                        WHERE b.tenant_id = e.tenant_id AND b.expected_item_id = e.id
+                          AND b.status = 'OPEN')) AS held`,
         ),
       );
     return new Map(

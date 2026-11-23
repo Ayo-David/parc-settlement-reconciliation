@@ -4,7 +4,7 @@ import type { Knex } from "knex";
 /** A refusal the API reports with its status and code. */
 export class SettlementError extends Error {
   public constructor(
-    public readonly status: 400 | 404 | 409 | 422 | 503,
+    public readonly status: 400 | 404 | 409 | 410 | 422 | 503,
     public readonly code: string,
     message: string,
     public readonly details?: unknown,
@@ -57,7 +57,8 @@ export function addDays(date: string, days: number): string {
 
 export interface OutboxFact {
   tenantId: string;
-  aggregateType: "reconciliation_run" | "reconciliation_break";
+  aggregateType:
+    "reconciliation_run" | "reconciliation_break" | "suspense_investigation";
   aggregateId: string;
   aggregateVersion: number;
   eventType: string;

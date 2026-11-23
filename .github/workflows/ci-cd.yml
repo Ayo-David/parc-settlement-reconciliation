@@ -168,7 +168,7 @@ jobs:
 
             # CB-7 slice A: the service and its two workers. The database comes from the
             # TS-DB-000 bootstrap (parc-platform/scripts/bootstrap-treasury-settlement.sql).
-            for key in DATABASE_URL MIGRATION_DATABASE_URL RABBITMQ_URL STATEMENT_STORE_ENDPOINT STATEMENT_STORE_ACCESS_KEY_ID STATEMENT_STORE_SECRET_ACCESS_KEY STATEMENT_ENCRYPTION_KEY_ID STATEMENT_ENCRYPTION_KEY_BASE64; do
+            for key in DATABASE_URL MIGRATION_DATABASE_URL RABBITMQ_URL STATEMENT_STORE_ENDPOINT STATEMENT_STORE_ACCESS_KEY_ID STATEMENT_STORE_SECRET_ACCESS_KEY STATEMENT_ENCRYPTION_KEY_ID STATEMENT_ENCRYPTION_KEY_BASE64 LEDGER_URL SERVICE_CLIENT_KEY_ID SERVICE_CLIENT_PRIVATE_KEY_BASE64; do
               if [ -z "$(env_value "$key")" ]; then
                 echo "$ENV_FILE must set $key." >&2
                 exit 1
