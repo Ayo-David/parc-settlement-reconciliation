@@ -1,0 +1,29 @@
+# Secret scanning (SEC-02): gitleaks' default rules, run on the working tree
+# in CI before anything is built. History is not scanned: the deferred key
+# rotation (D23) is the control for what history already contains.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Dependencies, build output and known non-secret patterns"
+paths = [
+  '''(^|/)node_modules/''',
+  '''(^|/)dist/''',
+  '''(^|/)coverage/''',
+  '''(^|/)\.yarn/''',
+]
+# Narrow line patterns, never whole files: a real secret pasted into
+# .env.example or a test is still reported.
+regexTarget = "line"
+regexes = [
+  # Idempotency keys are opaque request identifiers, not credentials.
+  '''(?i)idempotency[_-]?key''',
+  # Key identifiers name a key; they are not key material.
+  '''(?i)[A-Z_]*KEY_ID\s*[=:]''',
+  # .env.example placeholders.
+  '''=\s*replace[-_a-z0-9]*\s*$''',
+  # Test fixtures named test-... are deliberately fake.
+  '''["']test-[A-Za-z0-9_-]*["']''',
+  # Auth's development-only identity key; production refuses to start with it.
+  '''DEVELOPMENT_IDENTITY_NUMBER_KEY''',
+]
